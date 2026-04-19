@@ -26,6 +26,7 @@ SLOT_HOURS = {
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CURRENT_WEEK_PATH = os.path.join(BASE_DIR, "current_week.json")
+TEMP_TODOS_PATH = os.path.join(BASE_DIR, "temp_todos.json")
 REFRESH_MS = 30_000
 DASHBOARD_URL = "http://localhost:8501"
 DASHBOARD_SCRIPT = os.path.join(BASE_DIR, "phantom_dashboard.py")
@@ -43,7 +44,7 @@ C_WHITE   = "#FFFFFF"
 C_CREAM   = "#F0EBE0"
 
 # ── 画布尺寸 ──
-W, H = 500, 518
+W, H = 500, 560
 
 # ── 时段配色 & 图标 ──
 SLOT_CFG = {
@@ -90,6 +91,71 @@ def load_data() -> dict:
         with open(CURRENT_WEEK_PATH, "r", encoding="utf-8") as f:
             return ensure_week_data(json.load(f))
     return ensure_week_data({})
+
+def normalize_temp_todos(raw) -> list:
+    def as_item(text: str, done: bool = False, item_id: str = None, created_at: str = None):
+        now_iso = datetime.now().isoformat(timespec="seconds")
+        return {
+            "id": item_id or f"todo-{int(datetime.now().timestamp() * 1000)}-{random.randint(100, 999)}",
+            "text": text,
+            "done": bool(done),
+            "created_at": created_at or now_iso,
+        }
+
+    if isinstance(raw, dict):
+        raw = raw.get("items", [])
+    if isinstance(raw, str):
+        raw = raw.splitlines()
+    if not isinstance(raw, list):
+        return []
+
+    normalized = []
+    for idx, item in enumerate(raw):
+        if isinstance(item, dict):
+            text = str(item.get("text", "")).strip()
+            if not text:
+                continue
+            normalized.append(
+                as_item(
+                    text=text,
+                    done=item.get("done", False),
+                    item_id=str(item.get("id") or f"todo-migrated-{idx}"),
+                    created_at=item.get("created_at"),
+                )
+            )
+            continue
+        if item is None:
+            continue
+        text = str(item).strip()
+        if text:
+            normalized.append(as_item(text=text))
+    return normalized
+
+def load_temp_todos() -> list:
+    if not os.path.exists(TEMP_TODOS_PATH):
+        return []
+    try:
+        with open(TEMP_TODOS_PATH, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return []
+    return normalize_temp_todos(raw)
+
+def save_temp_todos(items: list):
+    payload = {
+        "items": normalize_temp_todos(items),
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    with open(TEMP_TODOS_PATH, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+def create_temp_item(text: str, done: bool = False) -> dict:
+    return {
+        "id": f"todo-{int(datetime.now().timestamp() * 1000)}-{random.randint(100, 999)}",
+        "text": text,
+        "done": bool(done),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
 
 def format_tasks(tasks: list) -> str:
     if not tasks:
@@ -168,11 +234,209 @@ def draw_moon(canvas, cx, cy, r):
                        fill=SLOT_CFG["Night"]["color"], outline="")
 
 
+def draw_rounded_rect(canvas, x1, y1, x2, y2, r, fill, outline, width=1):
+    r = max(2, min(r, int((x2 - x1) / 2), int((y2 - y1) / 2)))
+    canvas.create_rectangle(x1 + r, y1, x2 - r, y2, fill=fill, outline=outline, width=width)
+    canvas.create_rectangle(x1, y1 + r, x2, y2 - r, fill=fill, outline=outline, width=width)
+    canvas.create_oval(x1, y1, x1 + 2 * r, y1 + 2 * r, fill=fill, outline=outline, width=width)
+    canvas.create_oval(x2 - 2 * r, y1, x2, y1 + 2 * r, fill=fill, outline=outline, width=width)
+    canvas.create_oval(x1, y2 - 2 * r, x1 + 2 * r, y2, fill=fill, outline=outline, width=width)
+    canvas.create_oval(x2 - 2 * r, y2 - 2 * r, x2, y2, fill=fill, outline=outline, width=width)
+
+
+class RemindersWindow(tk.Toplevel):
+    def __init__(self, parent, on_change, on_close=None):
+        super().__init__(parent)
+        self._on_change = on_change
+        self._on_close = on_close
+        self.items = load_temp_todos()
+
+        self.title("提醒事项")
+        self.geometry("440x560+120+120")
+        self.configure(bg="#F2F2F7")
+        self.resizable(False, False)
+        self.attributes("-topmost", True)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+
+        self._pending_var = tk.StringVar(value="待办 0")
+        self._build_ui()
+        self._refresh_list()
+
+    def _build_ui(self):
+        header = tk.Frame(self, bg="#F2F2F7")
+        header.pack(fill="x", padx=14, pady=(12, 8))
+
+        tk.Label(
+            header,
+            text="提醒事项",
+            font=("Microsoft YaHei", 14, "bold"),
+            fg="#1C1C1E",
+            bg="#F2F2F7",
+        ).pack(side="left")
+
+        tk.Label(
+            header,
+            textvariable=self._pending_var,
+            font=("Microsoft YaHei", 10),
+            fg="#636366",
+            bg="#F2F2F7",
+        ).pack(side="right")
+
+        list_card = tk.Frame(self, bg="#FFFFFF", highlightthickness=1, highlightbackground="#E5E5EA")
+        list_card.pack(fill="both", expand=True, padx=14, pady=(0, 10))
+
+        self._listbox = tk.Listbox(
+            list_card,
+            font=("Microsoft YaHei", 11),
+            bg="#FFFFFF",
+            fg="#1C1C1E",
+            selectbackground="#E5F1FF",
+            selectforeground="#1C1C1E",
+            activestyle="none",
+            borderwidth=0,
+            highlightthickness=0,
+        )
+        self._listbox.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
+
+        scrollbar = tk.Scrollbar(list_card, command=self._listbox.yview)
+        scrollbar.pack(side="right", fill="y", pady=8, padx=(0, 8))
+        self._listbox.configure(yscrollcommand=scrollbar.set)
+
+        actions = tk.Frame(self, bg="#F2F2F7")
+        actions.pack(fill="x", padx=14, pady=(0, 8))
+
+        tk.Button(
+            actions,
+            text="切换完成",
+            command=self._toggle_done,
+            bg="#FFFFFF",
+            fg="#0A84FF",
+            activebackground="#EAF3FF",
+            relief="flat",
+            font=("Microsoft YaHei", 10, "bold"),
+        ).pack(side="left", padx=(0, 8))
+
+        tk.Button(
+            actions,
+            text="删除选中",
+            command=self._delete_selected,
+            bg="#FFFFFF",
+            fg="#FF3B30",
+            activebackground="#FFF0EF",
+            relief="flat",
+            font=("Microsoft YaHei", 10, "bold"),
+        ).pack(side="left")
+
+        add_card = tk.Frame(self, bg="#FFFFFF", highlightthickness=1, highlightbackground="#E5E5EA")
+        add_card.pack(fill="x", padx=14, pady=(0, 14))
+
+        tk.Label(
+            add_card,
+            text="快速添加（每行一项）",
+            font=("Microsoft YaHei", 9),
+            fg="#636366",
+            bg="#FFFFFF",
+        ).pack(anchor="w", padx=8, pady=(8, 4))
+
+        self._input = tk.Text(
+            add_card,
+            height=5,
+            font=("Microsoft YaHei", 10),
+            bg="#FFFFFF",
+            fg="#1C1C1E",
+            insertbackground="#1C1C1E",
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground="#D1D1D6",
+            highlightcolor="#0A84FF",
+        )
+        self._input.pack(fill="x", padx=8, pady=(0, 8))
+
+        foot = tk.Frame(add_card, bg="#FFFFFF")
+        foot.pack(fill="x", padx=8, pady=(0, 8))
+
+        tk.Button(
+            foot,
+            text="添加多行",
+            command=self._add_lines,
+            bg="#0A84FF",
+            fg="#FFFFFF",
+            activebackground="#006BE0",
+            relief="flat",
+            font=("Microsoft YaHei", 10, "bold"),
+        ).pack(side="right")
+
+        tk.Button(
+            foot,
+            text="关闭",
+            command=self._close,
+            bg="#FFFFFF",
+            fg="#1C1C1E",
+            activebackground="#EFEFF4",
+            relief="flat",
+            font=("Microsoft YaHei", 10, "bold"),
+        ).pack(side="right", padx=(0, 8))
+
+    def _refresh_list(self):
+        self._listbox.delete(0, tk.END)
+        for item in self.items:
+            mark = "✓" if item.get("done", False) else "○"
+            self._listbox.insert(tk.END, f"{mark}  {item.get('text', '')}")
+        pending = sum(1 for item in self.items if not item.get("done", False))
+        self._pending_var.set(f"待办 {pending}")
+
+    def _persist(self):
+        save_temp_todos(self.items)
+        if callable(self._on_change):
+            self._on_change(self.items)
+
+    def _selected_index(self):
+        selected = self._listbox.curselection()
+        if not selected:
+            return None
+        return selected[0]
+
+    def _toggle_done(self):
+        idx = self._selected_index()
+        if idx is None:
+            return
+        self.items[idx]["done"] = not bool(self.items[idx].get("done", False))
+        self._persist()
+        self._refresh_list()
+        self._listbox.selection_set(idx)
+
+    def _delete_selected(self):
+        idx = self._selected_index()
+        if idx is None:
+            return
+        self.items.pop(idx)
+        self._persist()
+        self._refresh_list()
+
+    def _add_lines(self):
+        raw = self._input.get("1.0", "end-1c")
+        lines = [line.strip() for line in raw.splitlines() if line.strip()]
+        if not lines:
+            return
+        for line in lines:
+            self.items.append(create_temp_item(line, done=False))
+        self._input.delete("1.0", "end")
+        self._persist()
+        self._refresh_list()
+
+    def _close(self):
+        if callable(self._on_close):
+            self._on_close()
+        self.destroy()
+
+
 # ───────── HUD 窗口 ─────────
 class HUD(tk.Tk):
     def __init__(self):
         super().__init__()
         self._dashboard_proc = None
+        self._temp_todos = load_temp_todos()
+        self._reminders_window = None
 
         # 窗口属性
         self.overrideredirect(True)
@@ -196,6 +460,7 @@ class HUD(tk.Tk):
 
         # 按钮热区 (后续在 _draw 中设定)
         self._btn_open = (0, 0, 0, 0)
+        self._btn_reminders = (0, 0, 0, 0)
         self._btn_close = (0, 0, 0, 0)
 
         self.refresh()
@@ -407,7 +672,7 @@ class HUD(tk.Tk):
 
     # ─────────── 按钮 ───────────
     def _draw_buttons(self, c):
-        by = H - 50
+        by = H - 92
         bh = 36
 
         # ── 左：打开看板（蓝色）──
@@ -442,6 +707,157 @@ class HUD(tk.Tk):
                       font=("Microsoft YaHei", 11, "bold"), fill=C_WHITE)
         self._btn_close = (rx1 - 5, by - 4, rx2, by + bh + 2)
 
+        # ── 下：打开提醒事项（苹果风格）──
+        ty = H - 46
+        tx1, tx2 = 25, W - 25
+        draw_rounded_rect(c, tx1, ty, tx2, ty + 30, 12,
+                  fill="#F2F2F7", outline="#D1D1D6", width=1)
+        c.create_text((tx1 + tx2) // 2, ty + 15,
+                  text="📝  打开提醒事项",
+                  font=("Microsoft YaHei", 10, "bold"), fill="#0A84FF")
+        self._btn_reminders = (tx1, ty, tx2, ty + 30)
+
+    # ─────────── 临时代办 ───────────
+    def _ensure_temp_editor(self):
+        if self._temp_editor is None:
+            self._temp_editor = tk.Text(
+                self,
+                font=("Microsoft YaHei", 10),
+                bg="#FFFFFF",
+                fg="#1C1C1E",
+                insertbackground="#1C1C1E",
+                relief="flat",
+                bd=1,
+                highlightthickness=1,
+                highlightbackground="#D1D1D6",
+                highlightcolor="#0A84FF",
+                padx=8,
+                pady=6,
+                undo=True,
+            )
+            if self._temp_editor_cache:
+                self._temp_editor.insert("1.0", self._temp_editor_cache)
+
+    def _hide_temp_editor(self):
+        if self._temp_editor is not None:
+            self._temp_editor.place_forget()
+
+    def _draw_temp_todos(self, c):
+        px1, py1, px2, py2 = 18, H - 184, W - 18, H - 18
+        self._temp_panel_rect = (px1, py1, px2, py2)
+        self._todo_check_hits = {}
+        self._todo_delete_hits = {}
+
+        draw_rounded_rect(c, px1, py1, px2, py2, 14,
+                          fill="#F2F2F7", outline="#D1D1D6", width=1)
+
+        c.create_text(px1 + 14, py1 + 19,
+                      text="提醒事项",
+                      font=("SF Pro Display", 12, "bold"),
+                      fill="#1C1C1E", anchor="w")
+
+        pending = sum(1 for item in self._temp_todos if not item.get("done", False))
+        c.create_text(px2 - 100, py1 + 19,
+                      text=f"待办 {pending}",
+                      font=("Microsoft YaHei", 9),
+                      fill="#636366", anchor="w")
+
+        # 展开/收起按钮
+        tx1, tx2 = px2 - 92, px2 - 12
+        ty1, ty2 = py1 + 8, py1 + 30
+        draw_rounded_rect(c, tx1, ty1, tx2, ty2, 10,
+                          fill="#FFFFFF", outline="#D1D1D6", width=1)
+        c.create_text((tx1 + tx2) // 2, (ty1 + ty2) // 2,
+                      text="展开" if not self._temp_expanded else "收起",
+                      font=("Microsoft YaHei", 9, "bold"), fill="#0A84FF")
+        self._btn_temp_toggle = (tx1, ty1, tx2, ty2)
+
+        list_x1, list_y1 = px1 + 10, py1 + 36
+        list_x2, list_y2 = px2 - 10, py2 - 86
+        draw_rounded_rect(c, list_x1, list_y1, list_x2, list_y2, 12,
+                          fill="#FFFFFF", outline="#E5E5EA", width=1)
+
+        row_h = 30
+        visible = max(1, (list_y2 - list_y1 - 8) // row_h)
+        shown_items = self._temp_todos[:visible]
+
+        if not shown_items:
+            c.create_text((list_x1 + list_x2) // 2, (list_y1 + list_y2) // 2,
+                          text="暂无提醒，展开后可批量新增",
+                          font=("Microsoft YaHei", 10), fill="#8E8E93")
+        else:
+            for idx, item in enumerate(shown_items):
+                iy = list_y1 + 6 + idx * row_h
+                cy = iy + row_h // 2
+
+                cx = list_x1 + 16
+                c.create_oval(cx - 8, cy - 8, cx + 8, cy + 8,
+                              fill="#0A84FF" if item.get("done", False) else "#FFFFFF",
+                              outline="#0A84FF" if item.get("done", False) else "#C7C7CC",
+                              width=1)
+                if item.get("done", False):
+                    c.create_text(cx, cy, text="✓", font=("Microsoft YaHei", 9, "bold"), fill="#FFFFFF")
+                self._todo_check_hits[item["id"]] = (cx - 10, cy - 10, cx + 10, cy + 10)
+
+                text = str(item.get("text", "")).strip()
+                display = text if len(text) <= 26 else text[:24] + "…"
+                t_color = "#8E8E93" if item.get("done", False) else "#1C1C1E"
+                c.create_text(list_x1 + 34, cy, text=display,
+                              font=("Microsoft YaHei", 10), fill=t_color, anchor="w")
+                if item.get("done", False):
+                    c.create_line(list_x1 + 34, cy, list_x1 + 34 + min(280, len(display) * 9), cy,
+                                  fill="#C7C7CC", width=1)
+
+                dx = list_x2 - 16
+                c.create_oval(dx - 9, cy - 9, dx + 9, cy + 9,
+                              fill="#FFF1F0", outline="#FFCCC7", width=1)
+                c.create_text(dx, cy, text="×", font=("Microsoft YaHei", 9, "bold"), fill="#FF3B30")
+                self._todo_delete_hits[item["id"]] = (dx - 10, cy - 10, dx + 10, cy + 10)
+
+                if idx < len(shown_items) - 1:
+                    c.create_line(list_x1 + 32, iy + row_h, list_x2 - 12, iy + row_h,
+                                  fill="#EFEFF4", width=1)
+
+            hidden = len(self._temp_todos) - len(shown_items)
+            if hidden > 0:
+                c.create_text(list_x2 - 12, list_y2 - 12,
+                              text=f"+{hidden} 条未显示",
+                              font=("Microsoft YaHei", 9), fill="#8E8E93", anchor="e")
+
+        if self._temp_expanded:
+            self._ensure_temp_editor()
+            ex1, ey1 = px1 + 12, py2 - 76
+            ew, eh = (px2 - px1) - 24, 40
+            self._temp_editor.place(x=ex1, y=ey1, width=ew, height=eh)
+
+            c.create_text(px1 + 14, py2 - 84,
+                          text="快速添加（每行一项）",
+                          font=("Microsoft YaHei", 9), fill="#636366", anchor="w")
+
+            sx1, sx2 = px2 - 178, px2 - 92
+            cx1, cx2 = px2 - 86, px2 - 12
+            by1, by2 = py2 - 30, py2 - 8
+
+            draw_rounded_rect(c, sx1, by1, sx2, by2, 10,
+                              fill="#0A84FF", outline="#0A84FF", width=1)
+            c.create_text((sx1 + sx2) // 2, (by1 + by2) // 2,
+                          text="保存", font=("Microsoft YaHei", 9, "bold"), fill=C_WHITE)
+            self._btn_temp_save = (sx1, by1, sx2, by2)
+
+            draw_rounded_rect(c, cx1, by1, cx2, by2, 10,
+                              fill="#FFFFFF", outline="#D1D1D6", width=1)
+            c.create_text((cx1 + cx2) // 2, (by1 + by2) // 2,
+                          text="取消", font=("Microsoft YaHei", 9, "bold"), fill="#1C1C1E")
+            self._btn_temp_cancel = (cx1, by1, cx2, by2)
+        else:
+            self._hide_temp_editor()
+            self._btn_temp_save = (0, 0, 0, 0)
+            self._btn_temp_cancel = (0, 0, 0, 0)
+            c.create_text(px1 + 12, py2 - 18,
+                          text="提示：展开后可勾选、删除，并支持每行新增",
+                          font=("Microsoft YaHei", 9),
+                          fill="#8E8E93", anchor="w")
+
     # ─────────── 装饰星星 ───────────
     def _draw_stars(self, c):
         random.seed(42)
@@ -463,10 +879,15 @@ class HUD(tk.Tk):
         if bx1 <= x <= bx2 and by1 <= y <= by2:
             self._open_dashboard()
             return
+        bx1, by1, bx2, by2 = self._btn_reminders
+        if bx1 <= x <= bx2 and by1 <= y <= by2:
+            self._open_reminders_window()
+            return
         bx1, by1, bx2, by2 = self._btn_close
         if bx1 <= x <= bx2 and by1 <= y <= by2:
             self._shutdown_all()
             return
+
         self._drag["x"] = event.x
         self._drag["y"] = event.y
 
@@ -490,6 +911,27 @@ class HUD(tk.Tk):
         self._start_streamlit()
         self.after(1500, lambda: webbrowser.open(DASHBOARD_URL))
 
+    def _on_reminders_changed(self, items):
+        self._temp_todos = normalize_temp_todos(items)
+
+    def _on_reminders_closed(self):
+        self._reminders_window = None
+
+    def _open_reminders_window(self):
+        if self._reminders_window is not None:
+            try:
+                if self._reminders_window.winfo_exists():
+                    self._reminders_window.focus_force()
+                    self._reminders_window.lift()
+                    return
+            except tk.TclError:
+                self._reminders_window = None
+        self._reminders_window = RemindersWindow(
+            self,
+            self._on_reminders_changed,
+            on_close=self._on_reminders_closed,
+        )
+
     def _shutdown_all(self):
         if self._dashboard_proc and self._dashboard_proc.poll() is None:
             self._dashboard_proc.terminate()
@@ -497,6 +939,9 @@ class HUD(tk.Tk):
                 self._dashboard_proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self._dashboard_proc.kill()
+        if self._reminders_window and self._reminders_window.winfo_exists():
+            self._reminders_window.destroy()
+            self._reminders_window = None
         self.destroy()
 
     # ── 刷新 ──
